@@ -73,6 +73,41 @@ def _win64_states():
     return states
 
 
+def ensure_hkcu_keys():
+    """把 win64 typelib 键 + IApplication Interface 键写入 HKCU (免提权)。
+
+    HKCU 键对本进程的 COM 代理构建 (LoadRegTypeLib / universal marshaler)
+    即可生效; OneNote 服务器进程不一定可见, 那需要 HKLM 的完整修复。
+    comtypes vtable 后端在 connect 失败时调用此函数自愈后重试。
+    """
+    import winreg
+    exe = _onenote_exe()
+    if not exe:
+        raise OneNoteComErrorUnavailable()
+    written = []
+    for guid, ver, res in TYPELIBS:
+        path = r'SOFTWARE\Classes\TypeLib\%s\%s\0\win64' % (guid, ver)
+        k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, path)
+        winreg.SetValueEx(k, None, 0, winreg.REG_SZ, '%s\\%d' % (exe, res))
+        winreg.CloseKey(k)
+        written.append(path)
+    iface = r'SOFTWARE\Classes\Interface\{452AC71A-B655-4967-A208-A4CC39DD7949}'
+    k = winreg.CreateKey(winreg.HKEY_CURRENT_USER, iface)
+    winreg.SetValueEx(k, None, 0, winreg.REG_SZ, 'IApplication')
+    winreg.SetValueEx(k, 'ProxyStubClsid32', 0, winreg.REG_SZ,
+                      '{00020424-0000-0000-C000-000000000046}')
+    winreg.SetValueEx(k, 'TypeLib', 0, winreg.REG_SZ,
+                      '{0EA692EE-BB50-4E3C-AEF0-356D91732725}')
+    winreg.SetValueEx(k, 'Version', 0, winreg.REG_SZ, '1.1')
+    winreg.CloseKey(k)
+    written.append(iface)
+    return written
+
+
+class OneNoteComErrorUnavailable(RuntimeError):
+    """ONENOTE.EXE 未找到, 无法确定 typelib 资源路径。"""
+
+
 def missing_win64_keys():
     """返回缺失 win64 平台键的 (GUID, 版本) 列表 (只认 HKLM 两个视图)。"""
     states = _win64_states()

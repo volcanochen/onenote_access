@@ -14,9 +14,22 @@
 
 - **Windows** + **OneNote 桌面版**（ONENOTE.EXE，非 UWP 版），且已启动并登录
 - Python 3.8+
-- `pip install pywin32`（唯一第三方依赖，COM 调用必需）
+- `pip install -r requirements.txt`（comtypes 为 vtable 直调后端；pywin32 为后备后端）
 
 > OneNote UWP 版 / 网页版不暴露 COM 接口，本组件不支持；此场景需走 Microsoft Graph API。
+
+## COM 后端说明（重要）
+
+组件内置**双 COM 后端**，自动选择：
+
+| 后端 | 依赖 | 说明 |
+|------|------|------|
+| **comtypes vtable 直调**（首选） | comtypes | QI `IApplication` 后按 vtable 槽位直调（2013 schema，out 参数在中间），**完全绕过 IDispatch::Invoke**，不受"Office C2R typelib 注册损坏 → ITypeInfo 分发失败"影响 |
+| pywin32 动态分发（后备） | pywin32 | typelib 注册正常的机器上可用；连接失败时自动重试瞬态 0x80080005 |
+
+首次连接失败时组件会**自动自愈**：把 typelib win64 键与 IApplication Interface 键
+写入 HKCU（免提权）后重试。若 OneNote 进程仍无法加载 typelib（影响 IDispatch 路径），
+vtable 后端不受影响，依然可用。
 
 ## 快速开始
 

@@ -1,2 +1,5 @@
 # OneNote COM 调用 (仅 Windows + OneNote 桌面版)
+# comtypes: vtable 直调后端 (首选, 绕过 IDispatch, 免受 C2R typelib 注册问题影响)
+comtypes>=1.4; sys_platform == "win32"
+# pywin32: 动态分发后备后端 (comtypes 不可用时自动降级)
 pywin32>=306; sys_platform == "win32"

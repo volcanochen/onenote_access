@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
-"""OneNote 桌面版 COM 后端封装 (只读, 仅 Windows)。
+"""OneNote 桌面版 COM 后端 (只读, 仅 Windows)。
 
-通过 pywin32 (win32com) 调用 OneNote.Application, 只使用三个只读方法:
-    GetHierarchy / GetPageContent / GetHyperlinkToObject
+双后端设计:
+    1. comtypes vtable 直调 (首选) —— 绕过 IDispatch::Invoke, 免受
+       "Office C2R typelib 注册损坏 -> ITypeInfo 分发失败" 的影响;
+       需要 comtypes 库。
+    2. pywin32 动态分发 (后备) —— 在 typelib 注册正常的机器上可用。
 
-不同 OneNote 版本对可选参数/返回值的互操作签名有差异, 因此每个方法都按
-多种调用样式逐一尝试, 取第一个返回非空结果的样式 (与 Extract-OneNote.ps1 同思路)。
+只使用三个只读方法: GetHierarchy / GetPageContent / GetHyperlinkToObject。
+2013 schema 下参数顺序为 [in]..., [out]... 交错 (out 不在末尾), 槽位严格
+按 typelib 枚举顺序对齐。
 """
 
 import logging
@@ -13,46 +17,108 @@ import logging
 log = logging.getLogger('onenote_access.com')
 
 # HierarchyScope
-HS_SELF = 0
-HS_CHILDREN = 1
-HS_NOTEBOOKS = 2
-HS_SECTIONS = 3
 HS_PAGES = 4
-
 # PageInfo
 PI_BASIC = 0
 PI_BINARY_DATA = 1
+# XMLSchema (2013)
+XS_CURRENT = 2
+
+# HRESULT
+HR_LIB_NOT_REGISTERED = -2147319779   # 0x8002801D TYPE_E_LIBNOTREGISTERED
+HR_SERVER_EXEC_FAILURE = -2146959355  # 0x80080005 CO_E_SERVER_EXEC_FAILURE
+
+HRESULT_HINTS = {
+    HR_LIB_NOT_REGISTERED:
+        '库没有注册 —— OneNote typelib 缺少 win64 平台键 (Office Click-to-Run '
+        '已知问题)。运行 python -m onenote_access fixregistry 修复。',
+    HR_SERVER_EXEC_FAILURE:
+        '服务器运行失败 (常为瞬时错误, 本组件已自动重试)。若持续出现: '
+        '请先手动打开 OneNote 桌面版并保持运行; 再运行 python -m onenote_access doctor。',
+    -2147221164:  # 0x80040154 REGDB_E_CLASSNOTREG
+        'COM 类未注册。通常表示未安装 OneNote 桌面版 (UWP 版不支持), '
+        '或 Python 与 Office 位数不一致。',
+    -2147221005:  # 0x800401F3 CO_E_CLASSSTRING
+        '无效的 ProgID。OneNote 桌面版可能未安装或安装损坏, 尝试修复 Office。',
+}
+
+
+def _hint_for(exc):
+    """从异常提取 HRESULT 并给出可操作提示 (无法提取返回空串)。"""
+    args = getattr(exc, 'args', []) or []
+    hr = args[0] if args else None
+    if isinstance(hr, int) and hr in HRESULT_HINTS:
+        return HRESULT_HINTS[hr]
+    return ''
 
 
 class OneNoteComError(RuntimeError):
     """COM 调用失败 (未安装桌面版 / 未启动 / 权限或环境限制)。"""
 
 
-# 常见 COM 失败 HRESULT -> 可操作提示
-HRESULT_HINTS = {
-    -2146959355:  # 0x80080005 CO_E_SERVER_EXEC_FAILURE
-        '服务器运行失败 (常为瞬时错误, 本组件已自动重试)。若持续出现: '
-        '请先手动打开 OneNote 桌面版并保持运行; 再运行 python -m onenote_access doctor。',
-    -2147319779:  # 0x8002801D TYPE_E_LIBNOTREGISTERED
-        '库没有注册 —— OneNote typelib 缺少 win64 平台键 (Office Click-to-Run 已知问题)。'
-        '运行 python -m onenote_access fixregistry 修复 (会弹 UAC 确认)。',
-    -2147221164:  # 0x80040154 REGDB_E_CLASSNOTREG
-        'COM 类未注册。通常表示未安装 OneNote 桌面版 (UWP 版不支持), '
-        '或 Python 与 Office 位数不一致 (32 位客户端找不到 64 位注册)。',
-    -2147221005:  # 0x800401F3 CO_E_CLASSSTRING
-        '无效的 ProgID。OneNote 桌面版可能未安装或安装损坏, 尝试修复 Office。',
-    -2147024894:  # 0x80070002 FILE_NOT_FOUND
-        '找不到 OneNote 服务程序, 可能安装不完整, 尝试修复 Office。',
-}
+# ================================================================ comtypes 后端
+
+_IApplication = None  # 惰性构建的接口类缓存
 
 
-def _com_error_hint(exc):
-    """从 pywintypes.com_error 提取 HRESULT 并给出可操作提示。"""
-    args = getattr(exc, 'args', []) or []
-    hresult = args[0] if args else None
-    if hresult in HRESULT_HINTS:
-        return HRESULT_HINTS[hresult]
-    return ''
+def _get_IApplication():
+    """定义 (缓存) OneNote 2013 IApplication 接口。
+
+    vtable 槽位严格按 typelib 枚举顺序; 未使用的槽用占位方法填充。
+    参数顺序为 2013 schema 的实际顺序: out 参数在中间而非末尾。
+    """
+    global _IApplication
+    if _IApplication is not None:
+        return _IApplication
+    import comtypes
+    from comtypes import COMMETHOD, GUID, HRESULT
+    from comtypes.automation import IDispatch, BSTR
+
+    dummy = (['in'], ctypes.c_int, 'reserved')
+
+    class IApplication(IDispatch):
+        _iid_ = GUID('{452AC71A-B655-4967-A208-A4CC39DD7949}')
+        _methods_ = [
+            # slot 7: GetHierarchy(id, scope, out xml, xsSchema)
+            COMMETHOD([], HRESULT, 'GetHierarchy',
+                      (['in'], BSTR, 'bstrStartNodeID'),
+                      (['in'], ctypes.c_int, 'hsScope'),
+                      (['out'], ctypes.POINTER(BSTR), 'pbstrHierarchyXmlOut'),
+                      (['in'], ctypes.c_int, 'xsSchema')),
+            # slots 8-13 占位 (UpdateHierarchy/OpenHierarchy/DeleteHierarchy/
+            # CreateNewPage/CloseNotebook/GetHierarchyParent)
+            COMMETHOD([], HRESULT, 'r8', dummy),
+            COMMETHOD([], HRESULT, 'r9', dummy),
+            COMMETHOD([], HRESULT, 'r10', dummy),
+            COMMETHOD([], HRESULT, 'r11', dummy),
+            COMMETHOD([], HRESULT, 'r12', dummy),
+            COMMETHOD([], HRESULT, 'r13', dummy),
+            # slot 14: GetPageContent(id, out xml, pageInfo, xsSchema)
+            COMMETHOD([], HRESULT, 'GetPageContent',
+                      (['in'], BSTR, 'bstrPageId'),
+                      (['out'], ctypes.POINTER(BSTR), 'pbstrPageXmlOut'),
+                      (['in'], ctypes.c_int, 'piPageInfoToGet'),
+                      (['in'], ctypes.c_int, 'xsSchema')),
+            # slots 15-21 占位 (UpdatePageContent/GetBinaryPageContent/
+            # DeletePageContent/NavigateTo/NavigateToUrl/Publish/OpenPackage)
+            COMMETHOD([], HRESULT, 'r15', dummy),
+            COMMETHOD([], HRESULT, 'r16', dummy),
+            COMMETHOD([], HRESULT, 'r17', dummy),
+            COMMETHOD([], HRESULT, 'r18', dummy),
+            COMMETHOD([], HRESULT, 'r19', dummy),
+            COMMETHOD([], HRESULT, 'r20', dummy),
+            COMMETHOD([], HRESULT, 'r21', dummy),
+            # slot 22: GetHyperlinkToObject(pageId, out link)
+            COMMETHOD([], HRESULT, 'GetHyperlinkToObject',
+                      (['in'], BSTR, 'bstrPageId'),
+                      (['out'], ctypes.POINTER(BSTR), 'pbstrHyperlinkLocation')),
+        ]
+
+    _IApplication = IApplication
+    return _IApplication
+
+
+import ctypes  # noqa: E402  (上面 _get_IApplication 引用了它)
 
 
 class OneNoteCom(object):
@@ -60,68 +126,144 @@ class OneNoteCom(object):
 
     def __init__(self):
         self._app = None
+        self._mode = None  # 'comtypes' | 'win32com'
         self._connected = False
 
     # -------------------------------------------------------------- 连接
 
     def connect(self):
-        """连接 OneNote COM。失败抛 OneNoteComError, 携带可操作的排查提示。
-
-        CO_E_SERVER_EXEC_FAILURE (0x80080005) 常为瞬时错误 (OneNote 服务
-        启动竞态), 自动重试 3 次。
-        """
+        """连接 OneNote COM。失败抛 OneNoteComError, 携带可操作的排查提示。"""
         if self._connected:
             return self._app
         try:
-            import win32com.client  # 延迟导入: 非 Windows / 未装 pywin32 时也能 import 本模块
-        except ImportError as e:
-            raise OneNoteComError(
-                'pywin32 未安装, 无法调用 OneNote COM。请在 Windows 上执行: '
-                'pip install pywin32 (原始错误: %s)' % e)
-        import time
-        last_exc = None
-        for attempt in range(3):
+            self._connect_comtypes()
+            self._mode = 'comtypes'
+        except ImportError:
+            self._connect_win32com()
+            self._mode = 'win32com'
+        except Exception as e:
+            # comtypes 存在但失败 (典型: typelib 注册缺失) -> 尝试 HKCU 自愈后重试,
+            # 仍失败再走 pywin32 后备; 都失败则抛出带提示的错误
+            last = e
             try:
-                self._app = win32com.client.Dispatch('OneNote.Application')
-                last_exc = None
-                break
-            except Exception as e:
-                last_exc = e
-                hresult = (getattr(e, 'args', [None]) or [None])[0]
-                if hresult == -2146959355 and attempt < 2:  # 0x80080005 瞬态
-                    time.sleep(1.5)
-                    continue
-                break
-        if last_exc is not None:
-            raise OneNoteComError(self._connect_error_text(last_exc))
+                from . import fixregistry
+                fixregistry.ensure_hkcu_keys()
+                self._connect_comtypes()
+                self._mode = 'comtypes'
+                log.info('HKCU typelib 自愈成功')
+            except Exception:
+                try:
+                    self._connect_win32com()
+                    self._mode = 'win32com'
+                except Exception as e2:
+                    raise OneNoteComError(self._connect_error_text(e2, last))
         self._connected = True
         return self._app
 
     @staticmethod
-    def _connect_error_text(e):
-        hint = _com_error_hint(e)
-        return ('无法创建 OneNote.Application COM 对象。请确认: '
-                '1) 已安装 OneNote 桌面版 (ONENOTE.EXE); '
-                '2) OneNote 已启动并登录; '
-                '3) 本进程与 OneNote 位数一致 (均为 64 位或 32 位)。'
-                + ('\n提示: ' + hint if hint else '')
+    def _connect_error_text(*errors):
+        hints = []
+        for e in errors:
+            h = _hint_for(e)
+            if h and h not in hints:
+                hints.append(h)
+        return ('无法连接 OneNote COM。请确认: '
+                '1) 已安装 OneNote 桌面版 (ONENOTE.EXE) 且已启动登录; '
+                '2) Python 与 Office 位数一致 (均为 64 位); '
+                + ('提示: ' + ' / '.join(hints) if hints else '')
                 + '\n运行 python -m onenote_access doctor 可自动诊断。'
-                '原始错误: %s' % e)
+                '原始错误: ' + ' | '.join(str(e)[:160] for e in errors))
+
+    def _connect_comtypes(self):
+        import comtypes.client
+        app = comtypes.client.CreateObject('OneNote.Application',
+                                           interface=_get_IApplication())
+        self._app = app
+
+    def _connect_win32com(self):
+        import time
+        import win32com.client
+        last = None
+        for attempt in range(3):
+            try:
+                self._app = win32com.client.Dispatch('OneNote.Application')
+                return
+            except Exception as e:
+                last = e
+                hr = (getattr(e, 'args', [None]) or [None])[0]
+                if hr == HR_SERVER_EXEC_FAILURE and attempt < 2:
+                    time.sleep(1.5)  # 瞬态错误重试
+        raise last
 
     def is_available(self):
         """探测 COM 是否真正可用 (冒烟测试: 真调一次 GetHierarchy)。"""
         try:
-            xml = self.get_hierarchy()
-            return bool(xml)
+            return bool(self.get_hierarchy())
         except Exception as e:
             log.debug('COM 冒烟测试失败: %s', e)
             return False
 
+    # -------------------------------------------------------------- 只读 API
+
+    def get_hierarchy(self):
+        """返回完整层级 XML (笔记本/分区组/分区/页面)。"""
+        self.connect()
+        try:
+            if self._mode == 'comtypes':
+                return self._app.GetHierarchy('', HS_PAGES, XS_CURRENT)
+            return self._win32_first('GetHierarchy',
+                                     [('', HS_PAGES), ('', HS_PAGES, XS_CURRENT)])
+        except Exception as e:
+            hint = _hint_for(e)
+            raise OneNoteComError('GetHierarchy 失败: %s%s'
+                                  % (str(e)[:300],
+                                     ('\n提示: ' + hint) if hint else ''))
+
+    def get_page_xml(self, page_id, with_images=True):
+        """返回页面内容 XML; 加密分区等不可读场景返回 None。"""
+        self.connect()
+        pi = PI_BINARY_DATA if with_images else PI_BASIC
+        try:
+            if self._mode == 'comtypes':
+                return self._app.GetPageContent(page_id, pi, XS_CURRENT)
+            variants = ([(page_id, pi, XS_CURRENT), (page_id, pi), (page_id,)]
+                        if with_images else
+                        [(page_id, pi, XS_CURRENT), (page_id, pi), (page_id,)])
+            return self._win32_first('GetPageContent', variants)
+        except Exception:
+            # 加密分区/已移动页面: 服务器返回业务错误, 按约定返回 None
+            return None
+
+    def get_page_hyperlink(self, page_id):
+        """返回 onenote:// 跳转链接; 失败返回 None (可选能力)。"""
+        try:
+            self.connect()
+            if self._mode == 'comtypes':
+                return self._app.GetHyperlinkToObject(page_id)
+            r = self._app.GetHyperlinkToObject(page_id)
+            if isinstance(r, tuple) and r:
+                r = r[0]
+            return r if (isinstance(r, str) and r.strip()) else None
+        except Exception as e:
+            log.debug('GetHyperlinkToObject 失败 (忽略): %s', e)
+            return None
+
     # -------------------------------------------------------------- 内部
 
-    @staticmethod
-    def _first_str(results, last_error):
-        """从多种调用样式的结果中取第一个非空字符串; 全部失败则抛错。"""
+    def _win32_first(self, method, arg_variants):
+        """pywin32 后备: 依次尝试多组参数, 取第一个非空字符串结果。"""
+        results, last_error = [], None
+        for args in arg_variants:
+            try:
+                r = getattr(self._app, method)(*args)
+                results.append((r, None))
+            except Exception as e:
+                if isinstance(e, AttributeError):
+                    e = OneNoteComError(
+                        '方法 %r 无法解析 (pywin32 动态分发) —— OneNote typelib '
+                        '不可加载。运行 python -m onenote_access fixregistry。' % method)
+                results.append((None, e))
+                last_error = e
         for r, err in results:
             if isinstance(r, tuple) and r:
                 r = r[0]
@@ -129,64 +271,6 @@ class OneNoteCom(object):
                 return r
             if err is not None:
                 last_error = err
-        hint = _com_error_hint(last_error)
+        hint = _hint_for(last_error)
         raise OneNoteComError('所有调用样式均未返回数据。最后错误: %s%s'
-                              % (last_error,
-                                 ('\n提示: ' + hint) if hint else ''))
-
-    def _try_variants(self, method, arg_variants):
-        """依次尝试多组参数调用 COM 方法, 收集 (结果, 异常)。"""
-        results = []
-        last_error = None
-        for args in arg_variants:
-            try:
-                r = getattr(self._app, method)(*args)
-                results.append((r, None))
-            except Exception as e:
-                if isinstance(e, AttributeError):
-                    # 动态分发解析不出方法名 = 对象的 typelib 加载失败
-                    # (Office C2R 缺 win64 平台键时的典型表现)
-                    e = OneNoteComError(
-                        '方法 %r 无法解析 (pywin32 动态分发) —— OneNote typelib '
-                        '不可加载。运行 python -m onenote_access fixregistry 修复 '
-                        '(弹 UAC)。' % method)
-                results.append((None, e))
-                last_error = e
-        return self._first_str(results, last_error)
-
-    # -------------------------------------------------------------- 只读 API
-
-    def get_hierarchy(self):
-        """返回完整层级 XML (笔记本/分区组/分区/页面)。"""
-        self.connect()
-        return self._try_variants('GetHierarchy', [
-            ('', HS_PAGES),          # 标准签名: (startNodeID, hsScope) -> retval
-            ('', HS_PAGES, 2),       # 部分版本多一个 xmlSchema 参数
-        ])
-
-    def get_page_xml(self, page_id, with_images=True):
-        """返回页面内容 XML。with_images=True 时内联 base64 图片。"""
-        self.connect()
-        if with_images:
-            variants = [(page_id, PI_BINARY_DATA, 2), (page_id, PI_BINARY_DATA),
-                        (page_id, PI_BASIC, 2), (page_id, PI_BASIC), (page_id,)]
-        else:
-            variants = [(page_id, PI_BASIC, 2), (page_id, PI_BASIC), (page_id,)]
-        try:
-            return self._try_variants('GetPageContent', variants)
-        except OneNoteComError:
-            # 加密分区等场景返回空不算致命, 与上层约定: 返回 None
-            return None
-
-    def get_page_hyperlink(self, page_id):
-        """返回 onenote:// 跳转链接; 失败返回 None (可选能力)。"""
-        try:
-            self.connect()
-            r = getattr(self._app, 'GetHyperlinkToObject')(page_id)
-            if isinstance(r, tuple) and r:
-                r = r[0]
-            if isinstance(r, str) and r.strip():
-                return r
-        except Exception as e:
-            log.debug('GetHyperlinkToObject 失败 (忽略): %s', e)
-        return None
+                              % (last_error, ('\n提示: ' + hint) if hint else ''))
