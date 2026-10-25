@@ -110,16 +110,30 @@ def build_ps_script(marker_path, exe_path):
     return '\r\n'.join(lines)
 
 
-def run_elevated(marker_path=MARKER_DEFAULT, timeout=120):
-    """写临时 ps1 并经 UAC 提权执行; 轮询结果标记文件。返回 (ok, 输出行)。"""
-    exe = _onenote_exe()
-    if not exe:
-        return False, ['未找到 ONENOTE.EXE, 无法确定 typelib 资源路径']
+def build_deep_repair_script(marker_path):
+    """深度修复: 重启 C2R 服务 (刷新注册表过滤视图) + 重启 OneNote。纯 ASCII。"""
+    lines = [
+        '$results = @()',
+        'try {',
+        '  Restart-Service ClickToRunSvc -Force -ErrorAction Stop',
+        '  $results += "OK: ClickToRunSvc restarted, status=" + '
+        '(Get-Service ClickToRunSvc).Status',
+        '} catch { $results += "FAIL: " + $_.Exception.Message }',
+        'Stop-Process -Name ONENOTE -Force -ErrorAction SilentlyContinue',
+        'Stop-Process -Name ONENOTEM -Force -ErrorAction SilentlyContinue',
+        '$results += "OK: OneNote restarted"',
+        '$results | Out-File -FilePath "%s" -Encoding utf8' % marker_path,
+    ]
+    return '\r\n'.join(lines)
+
+
+def run_elevated_script(body, marker_path, timeout=180):
+    """把 PowerShell 脚本体写成临时 ps1 并经 UAC 提权执行。返回 (ok, 输出行)。"""
     if os.path.exists(marker_path):
         os.remove(marker_path)
     ps1 = marker_path.replace('.txt', '.ps1')
     with open(ps1, 'w', encoding='ascii') as f:
-        f.write(build_ps_script(marker_path, exe))
+        f.write(body)
 
     ret = ctypes.windll.shell32.ShellExecuteW(
         None, 'runas', 'powershell.exe',
@@ -135,6 +149,14 @@ def run_elevated(marker_path=MARKER_DEFAULT, timeout=120):
                 return True, [line.rstrip() for line in f if line.strip()]
         time.sleep(1)
     return False, ['超时: 未等到提权脚本的结果文件 (%s)' % marker_path]
+
+
+def run_elevated(marker_path=MARKER_DEFAULT, timeout=180):
+    """补写 win64 键 (提权)。返回 (ok, 输出行)。"""
+    exe = _onenote_exe()
+    if not exe:
+        return False, ['未找到 ONENOTE.EXE, 无法确定 typelib 资源路径']
+    return run_elevated_script(build_ps_script(marker_path, exe), marker_path, timeout)
 
 
 def verify():
@@ -168,25 +190,42 @@ def main():
         if not (hklm_ok and c2r_ok):
             need_fix = True
     if not need_fix:
-        print('\n[OK] 两个 HKLM 视图的 win64 键都已存在, 无需修复。')
-        ok, msg = verify()
-        print('[%s] %s' % ('OK' if ok else '--', msg))
-        return 0 if ok else 1
-    print('\n即将以管理员权限补写 HKLM 注册表键并重启 OneNote (弹 UAC, 请点"是")...\n')
-    ok, lines = run_elevated()
-    for line in lines:
-        print('  ' + line)
-    if not ok:
-        return 1
-    # 给 OneNote 自动重启留一点时间
-    print('\n等待 OneNote 重新启动...')
-    time.sleep(5)
+        print('\n[OK] 两个 HKLM 视图的 win64 键都已存在。')
+    else:
+        print('\n即将以管理员权限补写 HKLM 注册表键并重启 OneNote (弹 UAC, 请点"是")...\n')
+        ok, lines = run_elevated()
+        for line in lines:
+            print('  ' + line)
+        if not ok:
+            return 1
+        print('\n等待 OneNote 重新启动...')
+        time.sleep(5)
+
     ok, msg = verify()
     print('[%s] %s' % ('OK' if ok else '--', msg))
     if ok:
         print('\n修复成功! 现在可以正常运行: python -m onenote_access list')
         return 0
-    print('\n如仍失败, 尝试手动打开 OneNote 后重跑 python -m onenote_access doctor')
+
+    # 键在但调用仍失败 -> 深度修复: 重启 C2R 服务刷新注册表过滤视图
+    print('\n尝试深度修复: 重启 ClickToRunSvc (刷新 C2R 注册表过滤视图) '
+          '+ 重启 OneNote...')
+    ok2, lines = run_elevated_script(
+        build_deep_repair_script(MARKER_DEFAULT), MARKER_DEFAULT)
+    for line in lines:
+        print('  ' + line)
+    if not ok2:
+        return 1
+    print('\n等待 OneNote 就绪...')
+    time.sleep(5)
+    ok3, msg3 = verify()
+    print('[%s] %s' % ('OK' if ok3 else '--', msg3))
+    if ok3:
+        print('\n深度修复成功! 现在可以正常运行: python -m onenote_access list')
+        return 0
+    print('\n深度修复后仍失败。建议执行 Office 快速修复 (重建全部 COM 注册):')
+    print('  设置 -> 应用 -> 安装的应用 -> Microsoft Office/365 -> 修改 -> 快速修复')
+    print('修复完成后重跑 python -m onenote_access doctor')
     return 1
 
 
