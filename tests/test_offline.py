@@ -169,6 +169,44 @@ def run_all(verbose=True):
     except ValueError:
         c.check('API export: 目录穿越被拦截', True)
 
+    # --- 7. doctor 诊断工具 ---
+    import struct as _struct
+    from onenote_access import doctor
+    from onenote_access.com_backend import _com_error_hint, OneNoteComError as _OCE
+
+    def _fake_pe(machine):
+        data = bytearray(0x100)
+        data[0:2] = b'MZ'
+        _struct.pack_into('<I', data, 0x3C, 0x80)
+        _struct.pack_into('<H', data, 0x84, machine)
+        p = os.path.join(tmpdir7, 'fake_onenote.exe')
+        with open(p, 'wb') as f:
+            f.write(bytes(data))
+        return p
+
+    tmpdir7 = tempfile.mkdtemp(prefix='onenote_doctor_')
+    try:
+        c.check('doctor: 64 位 PE 识别', doctor.exe_bitness(_fake_pe(0x8664)) == 64)
+        c.check('doctor: 32 位 PE 识别', doctor.exe_bitness(_fake_pe(0x14C)) == 32)
+        c.check('doctor: 非 PE 文件', doctor.exe_bitness(__file__) is None)
+        c.check('doctor: python 位数合理', doctor.python_bitness() in (32, 64))
+    finally:
+        shutil.rmtree(tmpdir7, ignore_errors=True)
+
+    class _FakeComErr(Exception):
+        def __init__(self, hr):
+            Exception.__init__(self, hr, 'x', None, None)
+
+    c.check('错误映射: 0x80080005 -> 启动提示',
+            'OneNote 未在运行' in _com_error_hint(_FakeComErr(-2146959355)))
+    c.check('错误映射: 0x80040154 -> 注册提示',
+            '未注册' in _com_error_hint(_FakeComErr(-2147221164)))
+    c.check('错误映射: 未知 HRESULT -> 空', _com_error_hint(_FakeComErr(-1)) == '')
+    try:
+        raise _OCE('无法创建 OneNote.Application COM 对象')
+    except _OCE:
+        c.check('OneNoteComError 可抛可捕', True)
+
     return c.ok, c.fail
 
 

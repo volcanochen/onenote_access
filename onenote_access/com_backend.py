@@ -28,6 +28,31 @@ class OneNoteComError(RuntimeError):
     """COM 调用失败 (未安装桌面版 / 未启动 / 权限或环境限制)。"""
 
 
+# 常见 COM 失败 HRESULT -> 可操作提示
+HRESULT_HINTS = {
+    -2146959355:  # 0x80080005 CO_E_SERVER_EXEC_FAILURE
+        '服务器运行失败。最常见的两个原因: '
+        '1) OneNote 未在运行 —— 请先手动打开 OneNote 桌面版并保持运行后重试; '
+        '2) Python 与 Office 位数不一致 —— 运行 python -m onenote_access doctor 检查。',
+    -2147221164:  # 0x80040154 REGDB_E_CLASSNOTREG
+        'COM 类未注册。通常表示未安装 OneNote 桌面版 (UWP 版不支持), '
+        '或 Python 与 Office 位数不一致 (32 位客户端找不到 64 位注册)。',
+    -2147221005:  # 0x800401F3 CO_E_CLASSSTRING
+        '无效的 ProgID。OneNote 桌面版可能未安装或安装损坏, 尝试修复 Office。',
+    -2147024894:  # 0x80070002 FILE_NOT_FOUND
+        '找不到 OneNote 服务程序, 可能安装不完整, 尝试修复 Office。',
+}
+
+
+def _com_error_hint(exc):
+    """从 pywintypes.com_error 提取 HRESULT 并给出可操作提示。"""
+    args = getattr(exc, 'args', []) or []
+    hresult = args[0] if args else None
+    if hresult in HRESULT_HINTS:
+        return HRESULT_HINTS[hresult]
+    return ''
+
+
 class OneNoteCom(object):
     """惰性连接的 OneNote COM 只读封装。进程内复用单个 Application 对象。"""
 
@@ -50,11 +75,14 @@ class OneNoteCom(object):
         try:
             self._app = win32com.client.Dispatch('OneNote.Application')
         except Exception as e:
+            hint = _com_error_hint(e)
             raise OneNoteComError(
                 '无法创建 OneNote.Application COM 对象。请确认: '
                 '1) 已安装 OneNote 桌面版 (ONENOTE.EXE); '
                 '2) OneNote 已启动并登录; '
                 '3) 本进程与 OneNote 位数一致 (均为 64 位或 32 位)。'
+                + ('\n提示: ' + hint if hint else '')
+                + '\n运行 python -m onenote_access doctor 可自动诊断。'
                 '原始错误: %s' % e)
         self._connected = True
         return self._app

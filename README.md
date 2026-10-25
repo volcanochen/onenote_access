@@ -126,7 +126,22 @@ python -m onenote_access export --out-dir D:\backup --notebook "工作*" --all
 python -m onenote_access export --out-dir .\out --search "整定" --no-images
 python -m onenote_access serve --host 0.0.0.0 --port 8765 --token <secret> --export-root D:\exports
 python -m onenote_access selftest        # 离线自测, 不连 OneNote
+python -m onenote_access doctor          # COM 环境诊断 (位数/进程/pywin32/冒烟)
 ```
+
+## 故障排查
+
+**首选：`python -m onenote_access doctor`** —— 自动检查 Python/OneNote 位数、
+ONENOTE.EXE 位置、OneNote 是否在运行、pywin32、COM 冒烟测试，并给出修复建议。
+
+常见错误：
+
+| 错误 | 原因 | 处理 |
+|------|------|------|
+| `0x80080005 服务器运行失败` | ① OneNote 未在运行；② Python 与 Office 位数不一致 | 先打开 OneNote 桌面版并保持运行后重试；仍失败跑 `doctor` 查位数（`py -0p` 可列出本机全部 Python） |
+| `0x80040154 COM 类未注册` | 未装桌面版（UWP 版不行）或位数不一致 | 安装桌面版；或换位数一致的 Python |
+| 导出某页失败 | 分区加密 | 在 OneNote 中输密码解密后重试 |
+| 503 (HTTP) | 服务端 COM 不可用 | 在服务端终端跑 `doctor` 按提示修复 |
 
 ## 输出格式
 

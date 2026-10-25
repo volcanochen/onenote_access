@@ -64,6 +64,11 @@ def cmd_serve(args):
                        (['--export-root', args.export_root] if args.export_root else []))
 
 
+def cmd_doctor(args):
+    from . import doctor
+    return doctor.main()
+
+
 def cmd_selftest(args):
     """离线自测: 不连 OneNote, 验证解析/转换/文件管线。"""
     sys.path.insert(0, 'tests')
@@ -103,6 +108,9 @@ def build_parser():
     sp = sub.add_parser('selftest', help='离线自测 (不连 OneNote)')
     sp.add_argument('-q', '--quiet', action='store_true')
     sp.set_defaults(func=cmd_selftest)
+
+    sp = sub.add_parser('doctor', help='诊断 COM 环境 (位数/进程/pywin32/冒烟测试)')
+    sp.set_defaults(func=cmd_doctor)
 
     return p
 
