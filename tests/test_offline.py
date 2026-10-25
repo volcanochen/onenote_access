@@ -197,11 +197,24 @@ def run_all(verbose=True):
         def __init__(self, hr):
             Exception.__init__(self, hr, 'x', None, None)
 
-    c.check('错误映射: 0x80080005 -> 启动提示',
-            'OneNote 未在运行' in _com_error_hint(_FakeComErr(-2146959355)))
+    c.check('错误映射: 0x80080005 -> 瞬时重试提示',
+            '自动重试' in _com_error_hint(_FakeComErr(-2146959355)))
     c.check('错误映射: 0x80040154 -> 注册提示',
             '未注册' in _com_error_hint(_FakeComErr(-2147221164)))
     c.check('错误映射: 未知 HRESULT -> 空', _com_error_hint(_FakeComErr(-1)) == '')
+
+    # --- 8. fixregistry 脚本生成与缺失检测 (纯逻辑部分) ---
+    from onenote_access import fixregistry
+    ps = fixregistry.build_ps_script('C:\\temp\\result.txt')
+    c.check('fixregistry: 4 个 win64 键 (2 typelib x 2 hive)',
+            ps.count('New-Item -Path') == 4, str(ps.count('New-Item -Path')))
+    c.check('fixregistry: 含 C2R 虚拟 hive',
+            'ClickToRun\\REGISTRY\\MACHINE' in ps)
+    c.check('fixregistry: 脚本含 win64 键与资源路径',
+            '\\win64' in ps and 'ONENOTE.EXE\\3' in ps and 'ONENOTE.EXE\\2' in ps)
+    c.check('fixregistry: 脚本会重启 OneNote', 'Stop-Process -Name ONENOTE' in ps)
+    c.check('fixregistry: 纯 ASCII (避免提权脚本编码问题)',
+            all(ord(ch) < 128 for ch in ps))
     try:
         raise _OCE('无法创建 OneNote.Application COM 对象')
     except _OCE:

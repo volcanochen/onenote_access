@@ -121,7 +121,18 @@ def run(verbose=True):
         issues.append('pywin32')
         advice.append('执行: pip install pywin32')
 
-    # 5. COM 冒烟测试
+    # 5. typelib 注册 (Office C2R 缺 win64 键的已知问题)
+    try:
+        import pythoncom
+        pythoncom.LoadRegTypeLib('{0EA692EE-BB50-4E3C-AEF0-356D91732725}', 1, 1, 0)
+        say(_OK + 'OneNote typelib 可加载 (LoadRegTypeLib)')
+    except Exception as e:
+        say(_BAD + 'OneNote typelib 不可加载: %s' % e)
+        issues.append('typelib')
+        advice.append('typelib 缺少 win64 平台键 (Office C2R 已知问题)。'
+                      '运行 python -m onenote_access fixregistry 修复 (弹 UAC)。')
+
+    # 6. COM 冒烟测试
     from .com_backend import OneNoteCom, OneNoteComError
     try:
         xml = OneNoteCom().get_hierarchy()

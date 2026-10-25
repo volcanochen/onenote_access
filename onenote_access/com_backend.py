@@ -31,9 +31,11 @@ class OneNoteComError(RuntimeError):
 # 常见 COM 失败 HRESULT -> 可操作提示
 HRESULT_HINTS = {
     -2146959355:  # 0x80080005 CO_E_SERVER_EXEC_FAILURE
-        '服务器运行失败。最常见的两个原因: '
-        '1) OneNote 未在运行 —— 请先手动打开 OneNote 桌面版并保持运行后重试; '
-        '2) Python 与 Office 位数不一致 —— 运行 python -m onenote_access doctor 检查。',
+        '服务器运行失败 (常为瞬时错误, 本组件已自动重试)。若持续出现: '
+        '请先手动打开 OneNote 桌面版并保持运行; 再运行 python -m onenote_access doctor。',
+    -2147319779:  # 0x8002801D TYPE_E_LIBNOTREGISTERED
+        '库没有注册 —— OneNote typelib 缺少 win64 平台键 (Office Click-to-Run 已知问题)。'
+        '运行 python -m onenote_access fixregistry 修复 (会弹 UAC 确认)。',
     -2147221164:  # 0x80040154 REGDB_E_CLASSNOTREG
         'COM 类未注册。通常表示未安装 OneNote 桌面版 (UWP 版不支持), '
         '或 Python 与 Office 位数不一致 (32 位客户端找不到 64 位注册)。',
@@ -63,7 +65,11 @@ class OneNoteCom(object):
     # -------------------------------------------------------------- 连接
 
     def connect(self):
-        """连接 OneNote COM。失败抛 OneNoteComError, 携带可操作的排查提示。"""
+        """连接 OneNote COM。失败抛 OneNoteComError, 携带可操作的排查提示。
+
+        CO_E_SERVER_EXEC_FAILURE (0x80080005) 常为瞬时错误 (OneNote 服务
+        启动竞态), 自动重试 3 次。
+        """
         if self._connected:
             return self._app
         try:
@@ -72,20 +78,35 @@ class OneNoteCom(object):
             raise OneNoteComError(
                 'pywin32 未安装, 无法调用 OneNote COM。请在 Windows 上执行: '
                 'pip install pywin32 (原始错误: %s)' % e)
-        try:
-            self._app = win32com.client.Dispatch('OneNote.Application')
-        except Exception as e:
-            hint = _com_error_hint(e)
-            raise OneNoteComError(
-                '无法创建 OneNote.Application COM 对象。请确认: '
+        import time
+        last_exc = None
+        for attempt in range(3):
+            try:
+                self._app = win32com.client.Dispatch('OneNote.Application')
+                last_exc = None
+                break
+            except Exception as e:
+                last_exc = e
+                hresult = (getattr(e, 'args', [None]) or [None])[0]
+                if hresult == -2146959355 and attempt < 2:  # 0x80080005 瞬态
+                    time.sleep(1.5)
+                    continue
+                break
+        if last_exc is not None:
+            raise OneNoteComError(self._connect_error_text(last_exc))
+        self._connected = True
+        return self._app
+
+    @staticmethod
+    def _connect_error_text(e):
+        hint = _com_error_hint(e)
+        return ('无法创建 OneNote.Application COM 对象。请确认: '
                 '1) 已安装 OneNote 桌面版 (ONENOTE.EXE); '
                 '2) OneNote 已启动并登录; '
                 '3) 本进程与 OneNote 位数一致 (均为 64 位或 32 位)。'
                 + ('\n提示: ' + hint if hint else '')
                 + '\n运行 python -m onenote_access doctor 可自动诊断。'
                 '原始错误: %s' % e)
-        self._connected = True
-        return self._app
 
     def is_available(self):
         """探测 COM 是否真正可用 (冒烟测试: 真调一次 GetHierarchy)。"""
@@ -108,7 +129,10 @@ class OneNoteCom(object):
                 return r
             if err is not None:
                 last_error = err
-        raise OneNoteComError('所有调用样式均未返回数据。最后错误: %s' % last_error)
+        hint = _com_error_hint(last_error)
+        raise OneNoteComError('所有调用样式均未返回数据。最后错误: %s%s'
+                              % (last_error,
+                                 ('\n提示: ' + hint) if hint else ''))
 
     def _try_variants(self, method, arg_variants):
         """依次尝试多组参数调用 COM 方法, 收集 (结果, 异常)。"""

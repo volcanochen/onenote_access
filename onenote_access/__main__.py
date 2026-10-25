@@ -69,6 +69,11 @@ def cmd_doctor(args):
     return doctor.main()
 
 
+def cmd_fixregistry(args):
+    from . import fixregistry
+    return fixregistry.main()
+
+
 def cmd_selftest(args):
     """离线自测: 不连 OneNote, 验证解析/转换/文件管线。"""
     sys.path.insert(0, 'tests')
@@ -111,6 +116,10 @@ def build_parser():
 
     sp = sub.add_parser('doctor', help='诊断 COM 环境 (位数/进程/pywin32/冒烟测试)')
     sp.set_defaults(func=cmd_doctor)
+
+    sp = sub.add_parser('fixregistry', help='修复 Office C2R 的 OneNote typelib '
+                        'win64 注册缺失 (弹 UAC, 需管理员确认)')
+    sp.set_defaults(func=cmd_fixregistry)
 
     return p
 

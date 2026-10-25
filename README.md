@@ -126,7 +126,8 @@ python -m onenote_access export --out-dir D:\backup --notebook "工作*" --all
 python -m onenote_access export --out-dir .\out --search "整定" --no-images
 python -m onenote_access serve --host 0.0.0.0 --port 8765 --token <secret> --export-root D:\exports
 python -m onenote_access selftest        # 离线自测, 不连 OneNote
-python -m onenote_access doctor          # COM 环境诊断 (位数/进程/pywin32/冒烟)
+python -m onenote_access doctor          # COM 环境诊断 (位数/进程/pywin32/typelib/冒烟)
+python -m onenote_access fixregistry     # 修复 Office C2R typelib win64 注册缺失 (弹 UAC)
 ```
 
 ## 故障排查
@@ -138,7 +139,8 @@ ONENOTE.EXE 位置、OneNote 是否在运行、pywin32、COM 冒烟测试，并�
 
 | 错误 | 原因 | 处理 |
 |------|------|------|
-| `0x80080005 服务器运行失败` | ① OneNote 未在运行；② Python 与 Office 位数不一致 | 先打开 OneNote 桌面版并保持运行后重试；仍失败跑 `doctor` 查位数（`py -0p` 可列出本机全部 Python） |
+| `0x80080005 服务器运行失败` | 瞬时错误（OneNote 服务启动竞态），组件已自动重试 3 次 | 若持续出现：先打开 OneNote 保持运行；再跑 `doctor` |
+| `0x8002801D 库没有注册` (TYPE_E_LIBNOTREGISTERED) | **Office Click-to-Run 只注册了 typelib 的 win32 平台键**，64 位进程（含 OneNote 自己）无法加载 typelib | 运行 `python -m onenote_access fixregistry`（自动提权补注册表 + 重启 OneNote，点 UAC"是"即可） |
 | `0x80040154 COM 类未注册` | 未装桌面版（UWP 版不行）或位数不一致 | 安装桌面版；或换位数一致的 Python |
 | 导出某页失败 | 分区加密 | 在 OneNote 中输密码解密后重试 |
 | 503 (HTTP) | 服务端 COM 不可用 | 在服务端终端跑 `doctor` 按提示修复 |
