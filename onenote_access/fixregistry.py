@@ -18,12 +18,10 @@ import os
 import sys
 import time
 
-# (typelib GUID, 版本, 内嵌资源路径后缀)
+# (typelib GUID, 版本, exe 内嵌 typelib 资源索引)
 TYPELIBS = [
-    ('{0EA692EE-BB50-4E3C-AEF0-356D91732725}', '1.1',
-     r'C:\Program Files\Microsoft Office\Root\Office16\ONENOTE.EXE\3'),
-    ('{F2A7EE29-8BF6-4a6d-83F1-098E366C709C}', '1.0',
-     r'C:\Program Files\Microsoft Office\Root\Office16\ONENOTE.EXE\2'),
+    ('{0EA692EE-BB50-4E3C-AEF0-356D91732725}', '1.1', 3),
+    ('{F2A7EE29-8BF6-4a6d-83F1-098E366C709C}', '1.0', 2),
 ]
 
 C2R_BASE = (r'HKLM:\SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE'
@@ -37,40 +35,64 @@ MARKER_DEFAULT = os.path.join(os.environ.get('TEMP', r'C:\Temp'),
                               'onenote_fixregistry_result.txt')
 
 
-def missing_win64_keys():
-    """返回缺失 win64 平台键的 (GUID, 版本) 列表 (查 HKCR 合并视图)。"""
+def _onenote_exe():
+    """定位 ONENOTE.EXE (含 ProgramFiles 环境变量为空的兜底)。"""
+    pf = os.environ.get('ProgramFiles') or r'C:\Program Files'
+    pf86 = os.environ.get('ProgramFiles(x86)') or r'C:\Program Files (x86)'
+    for base in (pf, pf86):
+        for rel in (r'Microsoft Office\Root\Office16\ONENOTE.EXE',
+                    r'Microsoft Office\Office16\ONENOTE.EXE',
+                    r'Microsoft Office\Root\Office15\ONENOTE.EXE'):
+            p = os.path.join(base, rel)
+            if os.path.exists(p):
+                return p
+    return None
+
+
+def _win64_states():
+    """检查每个 typelib 在两个 HKLM 视图的 win64 键。
+
+    返回 {(guid, ver): (hklm_ok, c2r_ok, exe_path)}。
+    注意: HKCU 的 win64 键对客户端进程有效, 但 OneNote 进程 (C2R 容器内)
+    不一定能看到, 所以不能算修复完成 —— 必须两个 HKLM 视图都有。
+    """
     import winreg
-    missing = []
-    for guid, ver, _ in TYPELIBS:
-        found = False
-        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+    exe = _onenote_exe()
+    states = {}
+    for guid, ver, _res in TYPELIBS:
+        def exists(path):
             try:
-                k = winreg.OpenKey(hive, r'SOFTWARE\Classes\TypeLib\%s\%s\0' % (guid, ver))
-                subs = []
-                i = 0
-                while True:
-                    try:
-                        subs.append(winreg.EnumKey(k, i).lower())
-                        i += 1
-                    except OSError:
-                        break
-                if 'win64' in subs:
-                    found = True
-                    break
+                winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, path)
+                return True
             except OSError:
-                continue
-        if not found:
-            missing.append((guid, ver))
-    return missing
+                return False
+        hklm_ok = exists(r'SOFTWARE\Classes\TypeLib\%s\%s\0\win64' % (guid, ver))
+        c2r_ok = exists(r'SOFTWARE\Microsoft\Office\ClickToRun\REGISTRY\MACHINE'
+                        r'\Software\Classes\TypeLib\%s\%s\0\win64' % (guid, ver))
+        states[(guid, ver)] = (hklm_ok, c2r_ok, exe)
+    return states
 
 
-def build_ps_script(marker_path):
+def missing_win64_keys():
+    """返回缺失 win64 平台键的 (GUID, 版本) 列表 (只认 HKLM 两个视图)。"""
+    states = _win64_states()
+    if not states:
+        return []
+    out = []
+    for (guid, ver), (hklm_ok, c2r_ok, _exe) in states.items():
+        if not (hklm_ok and c2r_ok):
+            out.append((guid, ver))
+    return out
+
+
+def build_ps_script(marker_path, exe_path):
     """生成提权后执行的 PowerShell 脚本内容 (纯 ASCII 路径, 无编码风险)。"""
     lines = [
         '$ErrorActionPreference = "Continue"',
         '$results = @()',
     ]
-    for guid, ver, path in TYPELIBS:
+    for guid, ver, res in TYPELIBS:
+        path = '%s\\%d' % (exe_path, res)
         for base in HIVE_BASES:
             key = r'%s\%s\%s\0\win64' % (base, guid, ver)
             lines.append('try {')
@@ -90,11 +112,14 @@ def build_ps_script(marker_path):
 
 def run_elevated(marker_path=MARKER_DEFAULT, timeout=120):
     """写临时 ps1 并经 UAC 提权执行; 轮询结果标记文件。返回 (ok, 输出行)。"""
+    exe = _onenote_exe()
+    if not exe:
+        return False, ['未找到 ONENOTE.EXE, 无法确定 typelib 资源路径']
     if os.path.exists(marker_path):
         os.remove(marker_path)
     ps1 = marker_path.replace('.txt', '.ps1')
     with open(ps1, 'w', encoding='ascii') as f:
-        f.write(build_ps_script(marker_path))
+        f.write(build_ps_script(marker_path, exe))
 
     ret = ctypes.windll.shell32.ShellExecuteW(
         None, 'runas', 'powershell.exe',
@@ -129,12 +154,24 @@ def verify():
 
 def main():
     print('==== OneNote typelib 注册修复 ====\n')
-    missing = missing_win64_keys()
-    if not missing:
-        print('[OK] win64 平台键已存在, 无需修复。')
-        return 0
-    for guid, ver in missing:
-        print('[--] 缺失: TypeLib\\%s\\%s\\0\\win64' % (guid, ver))
+    exe = _onenote_exe()
+    if not exe:
+        print('[--] 未找到 ONENOTE.EXE (OneNote 桌面版未安装?)')
+        return 1
+    print('[i]  OneNote: %s' % exe)
+    states = _win64_states()
+    need_fix = False
+    for (guid, ver), (hklm_ok, c2r_ok, _e) in states.items():
+        mark = lambda ok: '[OK]  ' if ok else '[--]  '
+        print('%sHKLM 真实 hive  TypeLib\\%s\\%s\\0\\win64' % (mark(hklm_ok), guid, ver))
+        print('%sC2R 虚拟 hive   TypeLib\\%s\\%s\\0\\win64' % (mark(c2r_ok), guid, ver))
+        if not (hklm_ok and c2r_ok):
+            need_fix = True
+    if not need_fix:
+        print('\n[OK] 两个 HKLM 视图的 win64 键都已存在, 无需修复。')
+        ok, msg = verify()
+        print('[%s] %s' % ('OK' if ok else '--', msg))
+        return 0 if ok else 1
     print('\n即将以管理员权限补写 HKLM 注册表键并重启 OneNote (弹 UAC, 请点"是")...\n')
     ok, lines = run_elevated()
     for line in lines:

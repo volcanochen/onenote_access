@@ -205,7 +205,9 @@ def run_all(verbose=True):
 
     # --- 8. fixregistry 脚本生成与缺失检测 (纯逻辑部分) ---
     from onenote_access import fixregistry
-    ps = fixregistry.build_ps_script('C:\\temp\\result.txt')
+    ps = fixregistry.build_ps_script(
+        'C:\\temp\\result.txt',
+        'C:\\Program Files\\Microsoft Office\\Root\\Office16\\ONENOTE.EXE')
     c.check('fixregistry: 4 个 win64 键 (2 typelib x 2 hive)',
             ps.count('New-Item -Path') == 4, str(ps.count('New-Item -Path')))
     c.check('fixregistry: 含 C2R 虚拟 hive',
@@ -215,6 +217,14 @@ def run_all(verbose=True):
     c.check('fixregistry: 脚本会重启 OneNote', 'Stop-Process -Name ONENOTE' in ps)
     c.check('fixregistry: 纯 ASCII (避免提权脚本编码问题)',
             all(ord(ch) < 128 for ch in ps))
+    c.check('fixregistry: exe 定位兜底可用',
+            fixregistry._onenote_exe() is None or
+            fixregistry._onenote_exe().endswith('ONENOTE.EXE'))
+    states = fixregistry._win64_states()
+    c.check('fixregistry: 状态检测覆盖两个 typelib', len(states) == 2,
+            str(list(states.keys())))
+    c.check('fixregistry: 检测只读注册表不抛错',
+            isinstance(fixregistry.missing_win64_keys(), list))
     try:
         raise _OCE('无法创建 OneNote.Application COM 对象')
     except _OCE:

@@ -143,6 +143,13 @@ class OneNoteCom(object):
                 r = getattr(self._app, method)(*args)
                 results.append((r, None))
             except Exception as e:
+                if isinstance(e, AttributeError):
+                    # 动态分发解析不出方法名 = 对象的 typelib 加载失败
+                    # (Office C2R 缺 win64 平台键时的典型表现)
+                    e = OneNoteComError(
+                        '方法 %r 无法解析 (pywin32 动态分发) —— OneNote typelib '
+                        '不可加载。运行 python -m onenote_access fixregistry 修复 '
+                        '(弹 UAC)。' % method)
                 results.append((None, e))
                 last_error = e
         return self._first_str(results, last_error)
