@@ -1,0 +1,2 @@
+# OneNote COM 调用 (仅 Windows + OneNote 桌面版)
+pywin32>=306; sys_platform == "win32"
